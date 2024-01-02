@@ -67,13 +67,24 @@ class Aggregator(ABC):
         else:
             return self._predict_core(list_series)
 
-    def _check_input(self, series: Union[TimeSeries, Sequence[TimeSeries]]):
+    def _check_input(
+        self, series: Union[TimeSeries, Sequence[TimeSeries]]
+    ) -> Sequence[TimeSeries]:
         """
-        Checks for input if:
-            - it is a (sequence of) multivariate series (width>1)
-            - (sequence of) series must be:
-                * a deterministic TimeSeries
-                * binary (only values equal to 0 or 1)
+        Checks whether the input series (each series if a sequence of series):
+            - is a multivariate series (width>1)
+            - is a deterministic TimeSeries
+            - is binary (only values equal to 0 or 1)
+
+        Returns
+        -------
+        Sequence[TimeSeries]
+            Returns the input series as a Sequence[TimeSeries]
+
+        Raises
+        ------
+        ValueError
+            If any of the above conditions is not satisfied.
         """
 
         list_series = series2seq(series)
