@@ -102,8 +102,24 @@ class AnomalyScorer(ABC):
             + f" (number of samples must be higher than 1, found: {series.n_samples}).",
         )
 
-    def _extract_deterministic(self, series: TimeSeries, name_series: str):
-        "Checks if the series is deterministic (number of samples is equal to one)."
+    def _extract_deterministic(
+        self, series: TimeSeries, name_series: str
+    ) -> TimeSeries:
+        """Checks if the series is deterministic (number of samples is equal to one).
+        If so, returns the input series. If not, extracts the 0.5 quantile from the
+        0.5 quantile from the stochastic time series.
+
+        Parameters
+        ----------
+            series (TimeSeries): Input time series to be checked.
+            name_series (str): Name of the series, used for detailed logging in case a
+                stochastic timesries is passed.
+
+        Returns
+        -------
+            TimeSeries: Original time series if `series` is deterministic.
+                0.5 quantile of the stochastic time series if `series` is stochastic.
+        """
 
         if not series.is_deterministic:
             logger.warning(
