@@ -55,7 +55,14 @@ class NormScorer(AnomalyScorer):
 
         self.ord = ord
         self.component_wise = component_wise
-        super().__init__(univariate_scorer=(not component_wise), window=1)
+        super().__init__(
+            univariate_scorer=(not component_wise),
+            fittable=False,
+            single_series_support=False,
+            probabilistic_support=False,
+            window=1,
+            window_agg=False,
+        )
 
     def __str__(self):
         return f"Norm (ord={self.ord})"

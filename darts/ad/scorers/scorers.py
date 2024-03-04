@@ -9,7 +9,7 @@ Scorers Base Classes
 
 import copy
 from abc import ABC, abstractmethod
-from typing import Any, Sequence, Union
+from typing import Any, List, Optional, Sequence, Union
 
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
@@ -33,8 +33,47 @@ class AnomalyScorer(ABC):
     """Base class for all anomaly scorers"""
 
     def __init__(
-        self, univariate_scorer: bool, window: int, trainable: bool = False
+        self,
+        univariate_scorer: bool,
+        fittable: bool,
+        single_series_support: bool,
+        probabilistic_support: bool,
+        window_agg: Optional[bool],
+        window: int = 1,
+        diff_fn: str = "abs_diff",
+        n_jobs: int = 1,
     ) -> None:
+        """
+        Args:
+            univariate_scorer (bool): If set to `True`, the scorer will output a univariate series
+                as anomaly scores, even if the input series is multivariate. If set to `False`, the
+                returned scores will preserse the dimensionality of the input time series.
+            window (int): If greater then 1, anomaly scores will be derived/combined so that each timestamp
+                t of the returned score series will be derived from the window [t-W, t] (considering a context
+                window instead of  single point). The returned scores will be `N - W + 1`. Defaults to 1.
+            fittable (bool): Whether the anomaly scorer should be fitted before being applied.
+            single_series_support (bool): Whether the anomaly scorer supports processing a single series besides
+                pairs of predictions and actual anomalies. If set to `False`, methods like eval_metric, score,
+                show_anomalies, will not be available, and the `*_from_prediction` methods should be used
+                instead.
+            probabilistic_support (bool): Whether the model expects the prediction series to be probabilistic
+                series.
+            window_agg (bool): Transforms a window-wise anomaly score into a point-wise anomaly score.
+                When using a window of size `W`, a scorer will return an anomaly score
+                with values that represent how anomalous each past `W` is. If the parameter
+                `window_agg` is set to True (default value), the scores for each point
+                can be assigned by aggregating the anomaly scores for each window the point
+                is included in.
+
+                This post-processing step is equivalent to a rolling average of length window
+                over the anomaly score series. The return anomaly score represents the abnormality
+                of each timestamp.
+            diff_fn (str, optional): Function used to reduce `actual_series` and `pred_series` to a single
+                series in case `single_series_support` is set to `True` and `*_from_prediction` methods
+                are called. Defaults to "abs_diff".
+            n_jobs (int, optional): Number of processes that will be instantiated for tasks that can be
+                parallelized. Defaults to 1.
+        """
 
         raise_if_not(
             type(window) is int,
@@ -47,10 +86,29 @@ class AnomalyScorer(ABC):
         )
 
         self.window = window
-
         self.univariate_scorer = univariate_scorer
+        self.fittable = fittable
+        self._fit_called = None
+        self._is_probabilistic = probabilistic_support
 
-        self.trainable = trainable
+        if fittable:
+            # indicates if the scorer has been trained yet
+            self._fit_called = False
+
+        # function used in ._diff_series() to convert 2 time series into 1
+        if diff_fn in {"abs_diff", "diff"}:
+            self.diff_fn = diff_fn
+        else:
+            raise ValueError(f"Metric should be 'diff' or 'abs_diff', found {diff_fn}")
+
+        raise_if_not(
+            type(window_agg) is bool,
+            f"Parameter `window_agg` must be Boolean, found type: {type(window_agg)}.",
+        )
+
+        self.window_agg = window_agg
+        self.single_series_support = single_series_support
+        self._n_jobs = n_jobs
 
     def _check_univariate_scorer(self, actual_anomalies: Sequence[TimeSeries]):
         """Checks if `actual_anomalies` contains only univariate series when the scorer has the
@@ -91,7 +149,7 @@ class AnomalyScorer(ABC):
     @property
     def is_probabilistic(self) -> bool:
         """Whether the scorer expects a probabilistic prediction for its first input."""
-        return False
+        return self._is_probabilistic
 
     def _assert_stochastic(self, series: TimeSeries, name_series: str):
         "Checks if the series is stochastic (number of samples is higher than one)."
@@ -135,6 +193,128 @@ class AnomalyScorer(ABC):
     def __str__(self):
         """returns the name of the scorer"""
         pass
+
+    def _fun_window_agg(
+        self, list_scores: Sequence[TimeSeries], window: int
+    ) -> Sequence[TimeSeries]:
+        """
+        Transforms a window-wise anomaly score into a point-wise anomaly score.
+
+        When using a window of size `W`, a scorer will return an anomaly score
+        with values that represent how anomalous each past `W` is. If the parameter
+        `window_agg` is set to True (default value), the scores for each point
+        can be assigned by aggregating the anomaly scores for each window the point
+        is included in.
+
+        This post-processing step is equivalent to a rolling average of length window
+        over the anomaly score series. The return anomaly score represents the abnormality
+        of each timestamp.
+        """
+        list_scores_point_wise = []
+        for score in list_scores:
+            mean_score = np.empty(score.all_values().shape)
+            for idx_point in range(len(score)):
+                # "look ahead window" to account for the "look behind window" of the scorer
+                mean_score[idx_point] = score.all_values(copy=False)[
+                    idx_point : idx_point + window
+                ].mean(axis=0)
+
+            score_point_wise = TimeSeries.from_times_and_values(
+                score.time_index, mean_score, columns=score.components
+            )
+
+            list_scores_point_wise.append(score_point_wise)
+
+        return list_scores_point_wise
+
+    def check_if_fit_called(self):
+        """Checks if the scorer has been fitted before calling its `score()` function."""
+
+        raise_if_not(
+            self._fit_called,
+            f"The Scorer {self.__str__()} has not been fitted yet. Call ``fit()`` first.",
+        )
+
+    def _check_single_series_support(func):
+        """Decorator checking whether the scorer supports processing single series. If not,
+        the `*_from_prediction` methods should be used instead.
+        """
+
+        def wrapper(self: "AnomalyScorer", *args, **kwargs):
+            raise_if_not(
+                self.single_series_support,
+                f"Cannot call {func.__name__} when `single_series_support` is set to `False`. Please"
+                "use the `*_from_prediction` methods instead.",
+            )
+            return func(self, *args, **kwargs)
+
+        return wrapper
+
+    def _check_probabilistic_series(
+        self, pred_series: Sequence[TimeSeries]
+    ) -> Sequence[TimeSeries]:
+        """Checking whether the `pred_series`:
+        - Is a stochastic series in case `is_probabilistic` is set to `True`, raises an exception
+        otherwise
+        - Extract a deterministic series from the stochastic series in case `pred_series` is stochastic
+        but the model expects a deterministic series.
+        """
+
+        new_series = []
+        for series in pred_series:
+            if self.is_probabilistic:
+                self._assert_stochastic(series, "pred_series")
+                new_series.append(series)
+            else:
+                new_series.append(self._extract_deterministic(series, "pred_series"))
+
+        return new_series
+
+    @_check_single_series_support
+    def eval_metric(
+        self,
+        actual_anomalies: Union[TimeSeries, Sequence[TimeSeries]],
+        series: Union[TimeSeries, Sequence[TimeSeries]],
+        metric: str = "AUC_ROC",
+    ) -> Union[float, Sequence[float], Sequence[Sequence[float]]]:
+        """Computes the anomaly score of the given time series, and returns the score
+        of an agnostic threshold metric.
+
+        Parameters
+        ----------
+        actual_anomalies
+            The ground truth of the anomalies (1 if it is an anomaly and 0 if not)
+        series
+            The (sequence of) series to detect anomalies from.
+        metric
+            Optionally, metric function to use. Must be one of "AUC_ROC" and "AUC_PR".
+            Default: "AUC_ROC"
+
+        Returns
+        -------
+        Union[float, Sequence[float], Sequence[Sequence[float]]]
+            Score of an agnostic threshold metric for the computed anomaly score
+                - ``float`` if `series` is a univariate series (dimension=1).
+                - ``Sequence[float]``
+
+                    * if `series` is a multivariate series (dimension>1), returns one
+                    value per dimension, or
+                    * if `series` is a sequence of univariate series, returns one value
+                    per series
+                - ``Sequence[Sequence[float]]]`` if `series` is a sequence of multivariate
+                series. Outer Sequence is over the sequence input and the inner Sequence
+                is over the dimensions of each element in the sequence input.
+        """
+        actual_anomalies = series2seq(actual_anomalies)
+        self._check_univariate_scorer(actual_anomalies)
+        anomaly_score = self.score(series)
+
+        if self.window_agg:
+            window = 1
+        else:
+            window = self.window
+
+        return eval_metric_from_scores(actual_anomalies, anomaly_score, window, metric)
 
     def eval_metric_from_prediction(
         self,
@@ -180,6 +360,83 @@ class AnomalyScorer(ABC):
 
         return eval_metric_from_scores(
             actual_anomalies, anomaly_score, self.window, metric
+        )
+
+    @_check_single_series_support
+    def show_anomalies(
+        self,
+        series: TimeSeries,
+        actual_anomalies: TimeSeries = None,
+        scorer_name: str = None,
+        title: str = None,
+        metric: str = None,
+    ):
+        """Plot the results of the scorer.
+
+        Computes the score on the given series input. And plots the results.
+
+        The plot will be composed of the following:
+            - the series itself.
+            - the anomaly score of the score.
+            - the actual anomalies, if given.
+
+        It is possible to:
+            - add a title to the figure with the parameter `title`
+            - give personalized name to the scorer with `scorer_name`
+            - show the results of a metric for the anomaly score (AUC_ROC or AUC_PR),
+            if the actual anomalies is provided.
+
+        Parameters
+        ----------
+        series
+            The series to visualize anomalies from.
+        actual_anomalies
+            The ground truth of the anomalies (1 if it is an anomaly and 0 if not)
+        scorer_name
+            Name of the scorer.
+        title
+            Title of the figure
+        metric
+            Optionally, Scoring function to use. Must be one of "AUC_ROC" and "AUC_PR".
+            Default: "AUC_ROC"
+        """
+
+        if isinstance(series, Sequence):
+            raise_if_not(
+                len(series) == 1,
+                "``show_anomalies`` expects one series for `series`,"
+                + f" found a list of length {len(series)} as input.",
+            )
+
+            series = series[0]
+
+        raise_if_not(
+            isinstance(series, TimeSeries),
+            "``show_anomalies`` expects an input of type TimeSeries,"
+            + f" found type {type(series)} for `series`.",
+        )
+
+        anomaly_score = self.score(series)
+
+        if title is None:
+            title = f"Anomaly results by scorer {self.__str__()}"
+
+        if scorer_name is None:
+            scorer_name = f"anomaly score by {self.__str__()}"
+
+        if self.window_agg:
+            window = 1
+        else:
+            window = self.window
+
+        return show_anomalies_from_scores(
+            series,
+            anomaly_scores=anomaly_score,
+            window=window,
+            names_of_scorers=scorer_name,
+            actual_anomalies=actual_anomalies,
+            title=title,
+            metric=metric,
         )
 
     def show_anomalies_from_prediction(
@@ -271,175 +528,10 @@ class AnomalyScorer(ABC):
             metric=metric,
         )
 
-    @abstractmethod
-    def _score_core_from_prediction(self, series: Any) -> Any:
-        pass
+    def _score_core(self, series: TimeSeries) -> TimeSeries:
+        raise NotImplementedError()
 
-    def score_from_prediction(
-        self,
-        actual_series: Union[TimeSeries, Sequence[TimeSeries]],
-        pred_series: Union[TimeSeries, Sequence[TimeSeries]],
-    ) -> Union[TimeSeries, Sequence[TimeSeries]]:
-        """Computes the anomaly score on the two (sequence of) series.
-
-        If a pair of sequences is given, they must contain the same number
-        of series. The scorer will score each pair of series independently
-        and return an anomaly score for each pair.
-
-        Parameters
-        ----------
-        actual_series:
-            The (sequence of) actual series.
-        pred_series
-            The (sequence of) predicted series.
-
-        Returns
-        -------
-        Union[TimeSeries, Sequence[TimeSeries]]
-            (Sequence of) anomaly score time series
-        """
-        list_actual_series, list_pred_series = series2seq(actual_series), series2seq(
-            pred_series
-        )
-        _assert_same_length(list_actual_series, list_pred_series)
-
-        anomaly_scores = []
-
-        for s1, s2 in zip(list_actual_series, list_pred_series):
-            _sanity_check_two_series(s1, s2)
-            s1, s2 = _intersect(s1, s2)
-            self._check_window_size(s1)
-            self._check_window_size(s2)
-            anomaly_scores.append(self._score_core_from_prediction(s1, s2))
-
-        if (
-            len(anomaly_scores) == 1
-            and not isinstance(pred_series, Sequence)
-            and not isinstance(actual_series, Sequence)
-        ):
-            return anomaly_scores[0]
-        else:
-            return anomaly_scores
-
-
-class FittableAnomalyScorer(AnomalyScorer):
-    """Base class of scorers that do need training."""
-
-    def __init__(
-        self,
-        univariate_scorer: bool,
-        window: int,
-        window_agg: bool,
-        diff_fn: str = "abs_diff",
-        n_jobs: int = 1,
-    ) -> None:
-        super().__init__(
-            univariate_scorer=univariate_scorer, window=window, trainable=True
-        )
-
-        # indicates if the scorer has been trained yet
-        self._fit_called = False
-
-        # function used in ._diff_series() to convert 2 time series into 1
-        if diff_fn in {"abs_diff", "diff"}:
-            self.diff_fn = diff_fn
-        else:
-            raise ValueError(f"Metric should be 'diff' or 'abs_diff', found {diff_fn}")
-
-        raise_if_not(
-            type(window_agg) is bool,
-            f"Parameter `window_agg` must be Boolean, found type: {type(window_agg)}.",
-        )
-        self.window_agg = window_agg
-
-        self._n_jobs = n_jobs
-
-    def _fun_window_agg(
-        self, list_scores: Sequence[TimeSeries], window: int
-    ) -> Sequence[TimeSeries]:
-        """
-        Transforms a window-wise anomaly score into a point-wise anomaly score.
-
-        When using a window of size `W`, a scorer will return an anomaly score
-        with values that represent how anomalous each past `W` is. If the parameter
-        `window_agg` is set to True (default value), the scores for each point
-        can be assigned by aggregating the anomaly scores for each window the point
-        is included in.
-
-        This post-processing step is equivalent to a rolling average of length window
-        over the anomaly score series. The return anomaly score represents the abnormality
-        of each timestamp.
-        """
-        list_scores_point_wise = []
-        for score in list_scores:
-            mean_score = np.empty(score.all_values().shape)
-            for idx_point in range(len(score)):
-                # "look ahead window" to account for the "look behind window" of the scorer
-                mean_score[idx_point] = score.all_values(copy=False)[
-                    idx_point : idx_point + window
-                ].mean(axis=0)
-
-            score_point_wise = TimeSeries.from_times_and_values(
-                score.time_index, mean_score, columns=score.components
-            )
-
-            list_scores_point_wise.append(score_point_wise)
-
-        return list_scores_point_wise
-
-    def check_if_fit_called(self):
-        """Checks if the scorer has been fitted before calling its `score()` function."""
-
-        raise_if_not(
-            self._fit_called,
-            f"The Scorer {self.__str__()} has not been fitted yet. Call ``fit()`` first.",
-        )
-
-    def eval_metric(
-        self,
-        actual_anomalies: Union[TimeSeries, Sequence[TimeSeries]],
-        series: Union[TimeSeries, Sequence[TimeSeries]],
-        metric: str = "AUC_ROC",
-    ) -> Union[float, Sequence[float], Sequence[Sequence[float]]]:
-        """Computes the anomaly score of the given time series, and returns the score
-        of an agnostic threshold metric.
-
-        Parameters
-        ----------
-        actual_anomalies
-            The ground truth of the anomalies (1 if it is an anomaly and 0 if not)
-        series
-            The (sequence of) series to detect anomalies from.
-        metric
-            Optionally, metric function to use. Must be one of "AUC_ROC" and "AUC_PR".
-            Default: "AUC_ROC"
-
-        Returns
-        -------
-        Union[float, Sequence[float], Sequence[Sequence[float]]]
-            Score of an agnostic threshold metric for the computed anomaly score
-                - ``float`` if `series` is a univariate series (dimension=1).
-                - ``Sequence[float]``
-
-                    * if `series` is a multivariate series (dimension>1), returns one
-                    value per dimension, or
-                    * if `series` is a sequence of univariate series, returns one value
-                    per series
-                - ``Sequence[Sequence[float]]]`` if `series` is a sequence of multivariate
-                series. Outer Sequence is over the sequence input and the inner Sequence
-                is over the dimensions of each element in the sequence input.
-        """
-        actual_anomalies = series2seq(actual_anomalies)
-        self._check_univariate_scorer(actual_anomalies)
-        anomaly_score = self.score(series)
-
-        if self.window_agg:
-            window = 1
-        else:
-            window = self.window
-
-        return eval_metric_from_scores(actual_anomalies, anomaly_score, window, metric)
-
+    @_check_single_series_support
     def score(
         self,
         series: Union[TimeSeries, Sequence[TimeSeries]],
@@ -470,95 +562,19 @@ class FittableAnomalyScorer(AnomalyScorer):
 
         list_series = [self._extract_deterministic(s, "series") for s in list_series]
 
-        anomaly_scores = self._score_core(list_series)
+        anomaly_scores = [self._score_core(series) for series in list_series]
 
         if len(anomaly_scores) == 1 and not isinstance(series, Sequence):
             return anomaly_scores[0]
         else:
             return anomaly_scores
 
-    def show_anomalies(
-        self,
-        series: TimeSeries,
-        actual_anomalies: TimeSeries = None,
-        scorer_name: str = None,
-        title: str = None,
-        metric: str = None,
-    ):
-        """Plot the results of the scorer.
-
-        Computes the score on the given series input. And plots the results.
-
-        The plot will be composed of the following:
-            - the series itself.
-            - the anomaly score of the score.
-            - the actual anomalies, if given.
-
-        It is possible to:
-            - add a title to the figure with the parameter `title`
-            - give personalized name to the scorer with `scorer_name`
-            - show the results of a metric for the anomaly score (AUC_ROC or AUC_PR),
-            if the actual anomalies is provided.
-
-        Parameters
-        ----------
-        series
-            The series to visualize anomalies from.
-        actual_anomalies
-            The ground truth of the anomalies (1 if it is an anomaly and 0 if not)
-        scorer_name
-            Name of the scorer.
-        title
-            Title of the figure
-        metric
-            Optionally, Scoring function to use. Must be one of "AUC_ROC" and "AUC_PR".
-            Default: "AUC_ROC"
-        """
-
-        if isinstance(series, Sequence):
-            raise_if_not(
-                len(series) == 1,
-                "``show_anomalies`` expects one series for `series`,"
-                + f" found a list of length {len(series)} as input.",
-            )
-
-            series = series[0]
-
-        raise_if_not(
-            isinstance(series, TimeSeries),
-            "``show_anomalies`` expects an input of type TimeSeries,"
-            + f" found type {type(series)} for `series`.",
-        )
-
-        anomaly_score = self.score(series)
-
-        if title is None:
-            title = f"Anomaly results by scorer {self.__str__()}"
-
-        if scorer_name is None:
-            scorer_name = f"anomaly score by {self.__str__()}"
-
-        if self.window_agg:
-            window = 1
-        else:
-            window = self.window
-
-        return show_anomalies_from_scores(
-            series,
-            anomaly_scores=anomaly_score,
-            window=window,
-            names_of_scorers=scorer_name,
-            actual_anomalies=actual_anomalies,
-            title=title,
-            metric=metric,
-        )
-
     def _score_core_from_prediction(
-        self,
-        actual_series: TimeSeries,
-        pred_series: TimeSeries,
+        self, actual_series: TimeSeries, pred_series: TimeSeries
     ) -> TimeSeries:
-        return
+        # does not need to be implemented in case there is no single series support,
+        # thus not making it abstract
+        raise NotImplementedError()
 
     def score_from_prediction(
         self,
@@ -589,21 +605,45 @@ class FittableAnomalyScorer(AnomalyScorer):
             (Sequence of) anomaly score time series
         """
 
-        self.check_if_fit_called()
+        if self.fittable:
+            self.check_if_fit_called()
+
+        def _check_ts_or_list_ts(input):
+            if not isinstance(actual_series, list):
+                input = [input]
+            for series in input:
+                _assert_timeseries(series)
+
+        _check_ts_or_list_ts(actual_series)
+        _check_ts_or_list_ts(pred_series)
 
         list_actual_series, list_pred_series = series2seq(actual_series), series2seq(
             pred_series
         )
+        # checking for probabilistic series or extracting a deterministic one
+        list_actual_series = [
+            self._extract_deterministic(s, "actual_series") for s in list_actual_series
+        ]
+
+        list_pred_series = self._check_probabilistic_series(list_pred_series)
+
         _assert_same_length(list_actual_series, list_pred_series)
 
         anomaly_scores = []
-        for (s1, s2) in zip(list_actual_series, list_pred_series):
+
+        for s1, s2 in zip(list_actual_series, list_pred_series):
             _sanity_check_two_series(s1, s2)
-            s1 = self._extract_deterministic(s1, "actual_series")
-            s2 = self._extract_deterministic(s2, "pred_series")
-            diff = self._diff_series(s1, s2)
-            self._check_window_size(diff)
-            anomaly_scores.append(self.score(diff))
+            s1, s2 = _intersect(s1, s2)
+            self._check_window_size(s1)
+            self._check_window_size(s2)
+
+            # if single series is supported, then we reduce the two series to one, and call _score_core
+            if self.single_series_support:
+                single_series = self._diff_series(s1, s2)
+                anomaly_scores.append(self._score_core(single_series))
+            # otherwise, we expect _score_core_from_prediction to be implemented, and we call that one
+            else:
+                anomaly_scores.append(self._score_core_from_prediction(s1, s2))
 
         if (
             len(anomaly_scores) == 1
@@ -614,6 +654,10 @@ class FittableAnomalyScorer(AnomalyScorer):
         else:
             return anomaly_scores
 
+    def _fit_core(self, series: List[TimeSeries]) -> Any:
+        raise NotImplementedError
+
+    @_check_single_series_support
     def fit(
         self,
         series: Union[TimeSeries, Sequence[TimeSeries]],
@@ -687,6 +731,10 @@ class FittableAnomalyScorer(AnomalyScorer):
         list_actual_series, list_pred_series = series2seq(actual_series), series2seq(
             pred_series
         )
+
+        list_actual_series = self._check_probabilistic_series(list_actual_series)
+        list_pred_series = self._check_probabilistic_series(list_pred_series)
+
         _assert_same_length(list_actual_series, list_pred_series)
 
         list_fit_series = []
@@ -697,15 +745,6 @@ class FittableAnomalyScorer(AnomalyScorer):
             list_fit_series.append(self._diff_series(s1, s2))
 
         self.fit(list_fit_series)
-        self._fit_called = True
-
-    @abstractmethod
-    def _fit_core(self, series: Any) -> Any:
-        pass
-
-    @abstractmethod
-    def _score_core(self, series: Any) -> Any:
-        pass
 
     def _diff_series(self, series_1: TimeSeries, series_2: TimeSeries) -> TimeSeries:
         """Applies the ``diff_fn`` to the two time series. Converts two time series into 1.
@@ -739,18 +778,31 @@ class FittableAnomalyScorer(AnomalyScorer):
             )
 
 
-class WindowedAnomalyScorer(FittableAnomalyScorer):
-    """Base class for anomaly scorers that rely on windows to detect anomalies"""
-
+class FittableAnomalyScorer(AnomalyScorer):
     def __init__(
-        self, window: int, univariate_scorer: bool, window_agg: bool, diff_fn: str
+        self,
+        univariate_scorer: bool,
+        single_series_support: bool,
+        probabilistic_support: bool,
+        window_agg: Optional[bool] = None,
+        window: int = 1,
+        diff_fn: str = "abs_diff",
+        n_jobs: int = 1,
     ) -> None:
         super().__init__(
-            window=window,
             univariate_scorer=univariate_scorer,
+            fittable=True,
+            single_series_support=single_series_support,
+            probabilistic_support=probabilistic_support,
             window_agg=window_agg,
+            window=window,
             diff_fn=diff_fn,
+            n_jobs=n_jobs,
         )
+
+
+class WindowedAnomalyScorer(FittableAnomalyScorer):
+    """Base class for anomaly scorers that rely on windows to detect anomalies"""
 
     def _tabularize_series(
         self, list_series: Sequence[TimeSeries], concatenate: bool, component_wise: bool
@@ -856,11 +908,9 @@ class WindowedAnomalyScorer(FittableAnomalyScorer):
         """Wrapper around model inference method"""
         pass
 
-    def _score_core(
-        self, list_series: Sequence[TimeSeries], *args, **kwargs
-    ) -> Sequence[TimeSeries]:
+    def _score_core(self, series: TimeSeries, *args, **kwargs) -> Sequence[TimeSeries]:
         """Apply the scorer (sub) model scoring method on the series components"""
-
+        list_series = [series]
         raise_if_not(
             all([(self.width_trained_on == series.width) for series in list_series]),
             "All series in 'series' must have the same number of components as the data used"
@@ -908,16 +958,37 @@ class WindowedAnomalyScorer(FittableAnomalyScorer):
             )
 
         if self.window > 1 and self.window_agg:
-            return self._fun_window_agg(list_anomaly_score, self.window)
+            return self._fun_window_agg(list_anomaly_score, self.window)[0]
         else:
-            return list_anomaly_score
+            return list_anomaly_score[0]
+
+    def _score_core_from_prediction(
+        self, actual_series: TimeSeries, pred_series: TimeSeries
+    ) -> TimeSeries:
+        diff_series = self._diff_series(actual_series, pred_series)
+        return self._score_core(diff_series)
 
 
 class NLLScorer(AnomalyScorer):
     """Parent class for all LikelihoodScorer"""
 
-    def __init__(self, window) -> None:
-        super().__init__(univariate_scorer=False, window=window)
+    def __init__(
+        self,
+        window: int = 1,
+        diff_fn: str = "abs_diff",
+        n_jobs: int = 1,
+        window_agg: bool = False,
+    ) -> None:
+        super().__init__(
+            univariate_scorer=False,
+            fittable=False,
+            single_series_support=False,
+            probabilistic_support=True,
+            window_agg=window_agg,
+            window=window,
+            diff_fn=diff_fn,
+            n_jobs=n_jobs,
+        )
 
     def _score_core_from_prediction(
         self,

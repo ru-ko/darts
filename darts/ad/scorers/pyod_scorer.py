@@ -117,6 +117,8 @@ class PyODScorer(WindowedAnomalyScorer):
             window=window,
             diff_fn=diff_fn,
             window_agg=window_agg,
+            single_series_support=True,
+            probabilistic_support=False,
         )
 
     def __str__(self):

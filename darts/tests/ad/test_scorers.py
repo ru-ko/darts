@@ -447,8 +447,8 @@ class TestAnomalyDetectionScorer:
 
     @pytest.mark.parametrize("scorer", list_NonFittableAnomalyScorer)
     def test_NonFittableAnomalyScorer(self, scorer):
-        # Check if trainable is False, being a NonFittableAnomalyScorer
-        assert not scorer.trainable
+        # Check if fittable is False, being a NonFittableAnomalyScorer
+        assert not scorer.fittable
 
         # checks for score_from_prediction()
         # input must be Timeseries or sequence of Timeseries
@@ -763,7 +763,7 @@ class TestAnomalyDetectionScorer:
 
         self.helper_check_type_window(scorer_to_test, **kwargs)
 
-        if scorer_to_test(**kwargs).trainable:
+        if scorer_to_test(**kwargs).fittable:
             # window must be smaller than the input of score()
             scorer = scorer_to_test(window=len(self.train) + 1, **kwargs)
             with pytest.raises(ValueError):
@@ -831,7 +831,7 @@ class TestAnomalyDetectionScorer:
     def expects_deterministic_input(self, scorer, **kwargs):
 
         scorer = scorer(**kwargs)
-        if scorer.trainable:
+        if scorer.fittable:
             scorer.fit(self.train)
             np.testing.assert_warns(scorer.score(self.probabilistic))
 

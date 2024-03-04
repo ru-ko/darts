@@ -28,7 +28,7 @@ class AnomalyModel(ABC):
             "all scorers must be of instance darts.ad.scorers.AnomalyScorer.",
         )
 
-        self.scorers_are_trainable = any(s.trainable for s in self.scorers)
+        self.scorers_are_trainable = any(s.fittable for s in self.scorers)
         self.univariate_scoring = any(s.univariate_scorer for s in self.scorers)
 
         self.model = model

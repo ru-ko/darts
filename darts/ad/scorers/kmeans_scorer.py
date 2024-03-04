@@ -127,6 +127,8 @@ class KMeansScorer(WindowedAnomalyScorer):
             window=window,
             diff_fn=diff_fn,
             window_agg=window_agg,
+            probabilistic_support=False,
+            single_series_support=True,
         )
 
     def __str__(self):

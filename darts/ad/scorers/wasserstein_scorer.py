@@ -16,14 +16,14 @@ from typing import Sequence
 import numpy as np
 from scipy.stats import wasserstein_distance
 
-from darts.ad.scorers.scorers import WindowedAnomalyScorer
+from darts.ad.scorers.scorers import FittableAnomalyScorer, WindowedAnomalyScorer
 from darts.logging import get_logger, raise_if_not
 from darts.timeseries import TimeSeries
 
 logger = get_logger(__name__)
 
 
-class WassersteinScorer(WindowedAnomalyScorer):
+class WassersteinScorer(WindowedAnomalyScorer, FittableAnomalyScorer):
     def __init__(
         self,
         window: int = 10,
@@ -136,6 +136,8 @@ class WassersteinScorer(WindowedAnomalyScorer):
             window=window,
             diff_fn=diff_fn,
             window_agg=window_agg,
+            single_series_support=True,
+            probabilistic_support=False,
         )
 
     def __str__(self):

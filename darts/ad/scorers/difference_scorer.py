@@ -13,7 +13,14 @@ from darts.timeseries import TimeSeries
 
 class DifferenceScorer(AnomalyScorer):
     def __init__(self) -> None:
-        super().__init__(univariate_scorer=False, window=1)
+        super().__init__(
+            univariate_scorer=False,
+            window=1,
+            fittable=False,
+            single_series_support=False,
+            probabilistic_support=False,
+            window_agg=False,
+        )
 
     def __str__(self):
         return "Difference"
@@ -23,6 +30,4 @@ class DifferenceScorer(AnomalyScorer):
         actual_series: TimeSeries,
         pred_series: TimeSeries,
     ) -> TimeSeries:
-        actual_series = self._extract_deterministic(actual_series, "actual_series")
-        pred_series = self._extract_deterministic(pred_series, "pred_series")
         return actual_series - pred_series
