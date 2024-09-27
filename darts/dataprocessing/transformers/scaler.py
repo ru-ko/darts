@@ -91,6 +91,10 @@ class Scaler(FittableDataTransformer, InvertibleDataTransformer):
         [-1.]
         >>> print(max(series_transformed.values()))
         [2.]
+        To get the scale and min parameters from the MinMaxScaler:
+        >>> mm_scaler = scaler._fitted_params[0]
+        >>> min_ = mm_scaler.min_
+        >>> scale_ = mm_scaler.scale_
         """
 
         if scaler is None:
